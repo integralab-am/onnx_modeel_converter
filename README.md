@@ -3,10 +3,14 @@
 This tool is designed to locally convert raw PyTorch depth estimation models (such as **Depth Anything V2**, **Distill-Any-Depth**, and **DinoV2**) from Hugging Face into the optimized **ONNX** format required by **FlatVR**.
 
 Models are exported with a fixed resolution and unified input/output tensor configurations:
-* **Input Node:** `image` (shape `[1, 3, Resolution, Resolution]`, normalized using ImageNet mean & std dev)
-* **Output Node:** `depth` (shape `[1, Resolution, Resolution]`)
+* **Input Node:** `image` (shape `[1, 3, Resolution, Resolution]`, **float32**, normalized using ImageNet mean & std dev)
+* **Output Node:** `depth` (shape `[1, Resolution, Resolution]`, **float32**)
 
 The tool automatically exports both the high-precision **FP32** version (`.onnx`) and the performance-optimized **FP16** version (`_fp16.onnx`).
+
+In the FP16 build only the weights are half precision — the graph boundary stays float32. FlatVR binds float32 tensors and fills them from a `RWBuffer<float>` compute shader, so a model with float16 inputs will not raise an error, it will hang. Both files are self-contained; the weights are never left in a separate `.onnx.data` sidecar.
+
+Pick a resolution that is a **multiple of 14**, the patch size of the DINOv2 backbone (e.g. `252`, `336`, `392`, `448`, `518`). Cost scales with the number of patches, so 392 sits roughly midway between the stock 252 and 518 presets in both speed and quality.
 
 ---
 

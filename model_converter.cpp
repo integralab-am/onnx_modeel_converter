@@ -118,31 +118,36 @@ def export_local_to_onnx(local_dir, resolution=518):
         print(f"[ERROR] ONNX export failed: {e}")
         return False
         
-    # Export FP16 ONNX
+    # Export FP16 ONNX.
+    #
+    # Casting the torch model with .half() before exporting makes the graph
+    # boundary float16 too, and FlatVR feeds its models float32: the tensors it
+    # binds are ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT and the compute shader that
+    # fills them writes a RWBuffer<float>. A model with float16 inputs does not
+    # error there, it hangs. Convert the exported FP32 graph instead and keep
+    # the boundary at float32, which is what the stock models ship as. It also
+    # removes the old GPU requirement, since nothing runs the model to do it.
+    try:
+        from onnxconverter_common import float16
+    except ImportError:
+        print("[WARNING] onnxconverter-common is not installed; skipping FP16.")
+        print("Install it with: pip install onnxconverter-common")
+        return True
+
     try:
         output_filename_fp16 = f"{folder_name}_{resolution}_fp16.onnx"
         output_path_fp16 = output_filename_fp16
-        print(f"\nExporting model to FP16 ONNX: {output_path_fp16}...")
-        
-        model_fp16 = model.half()
-        dummy_input_fp16 = dummy_input.half()
-        wrapper_fp16 = OnnxWrapper(model_fp16)
-        wrapper_fp16.eval()
-        
-        torch.onnx.export(
-            wrapper_fp16,
-            dummy_input_fp16,
-            output_path_fp16,
-            export_params=True,
-            opset_version=14,
-            do_constant_folding=True,
-            input_names=['image'],
-            output_names=['depth']
-        )
-        inline_external_data(output_path_fp16)
+        print(f"\nConverting to FP16 ONNX: {output_path_fp16}...")
+
+        import onnx
+        fp32_model = onnx.load(output_path)
+        fp16_model = float16.convert_float_to_float16(
+            fp32_model, keep_io_types=True, disable_shape_infer=True)
+        onnx.save(fp16_model, output_path_fp16, save_as_external_data=False)
+
         print(f"[SUCCESS] FP16 ONNX model saved to: {output_path_fp16}")
     except Exception as e:
-        print(f"[WARNING] Could not export FP16 version automatically (often requires GPU): {e}")
+        print(f"[WARNING] Could not produce the FP16 version: {e}")
         print("You can still use the FP32 version which was successfully exported.")
         
     return True
@@ -205,8 +210,8 @@ int main() {
     }
 
     // 2. Install dependencies
-    std::cout << "[INFO] Verifying/installing packages (torch, transformers, onnx)...\n";
-    std::string pip_cmd = python_cmd + " -m pip install torch torchvision transformers onnx --upgrade --no-cache-dir";
+    std::cout << "[INFO] Verifying/installing packages (torch, transformers, onnx, onnxconverter-common)...\n";
+    std::string pip_cmd = python_cmd + " -m pip install torch torchvision transformers onnx onnxconverter-common --upgrade --no-cache-dir";
     int pip_res = std::system(pip_cmd.c_str());
     if (pip_res != 0) {
         std::cerr << "[ERROR] Failed to install/verify python packages.\n";
