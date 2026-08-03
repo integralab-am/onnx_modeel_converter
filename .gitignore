@@ -1,0 +1,15 @@
+# Build output
+model_converter.exe
+*.obj
+*.pdb
+*.ilk
+build/
+
+# Downloaded Hugging Face model folders and exported models live next to the
+# executable; they are hundreds of megabytes and are not part of the tool.
+*.onnx
+*.onnx.data
+*.safetensors
+
+# Written and removed by the converter at runtime
+temp_export_onnx.py

@@ -30,7 +30,7 @@ echo.
 
 git push -u origin main
 
-if %errorlevel% eq 0 (
+if %errorlevel% equ 0 (
     echo.
     echo [SUCCESS] Successfully pushed to GitHub!
 ) else (

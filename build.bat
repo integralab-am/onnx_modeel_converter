@@ -7,7 +7,7 @@ echo.
 
 REM Try standard MSVC environment first
 where cl.exe >nul 2>&1
-if %errorlevel% eq 0 (
+if %errorlevel% equ 0 (
     echo [INFO] Compiling using active compiler...
     cl /EHsc /std:c++17 model_converter.cpp /Fe:model_converter.exe
 ) else if exist "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvarsall.bat" (

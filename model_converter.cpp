@@ -12,6 +12,35 @@ const std::string PY_SCRIPT_CONTENT = R"(import argparse
 import sys
 import os
 
+def inline_external_data(path):
+    """Fold the weights back into the .onnx file.
+
+    Newer torch exporters write the tensors to a sibling '<name>.onnx.data' and
+    leave only the graph behind, which makes the .onnx a ~2 MB stub. FlatVR is
+    handed a single path and the instructions say to copy one file, so a model
+    split in two silently fails to load wherever it lands.
+    """
+    try:
+        import onnx
+    except ImportError:
+        print("[WARNING] onnx not available, leaving external weights as-is.")
+        return
+
+    try:
+        model = onnx.load(path)  # pulls the sidecar in
+        onnx.save(model, path, save_as_external_data=False)
+    except Exception as e:
+        print(f"[WARNING] Could not inline external weights: {e}")
+        return
+
+    sidecar = path + ".data"
+    if os.path.exists(sidecar):
+        try:
+            os.remove(sidecar)
+        except OSError:
+            pass
+    print(f"[INFO] Weights inlined; {os.path.basename(path)} is self-contained.")
+
 def export_local_to_onnx(local_dir, resolution=518):
     print("--------------------------------------------------")
     print(f"Loading local model from directory: {local_dir}")
@@ -58,7 +87,10 @@ def export_local_to_onnx(local_dir, resolution=518):
                 return out
                 
     wrapper = OnnxWrapper(model)
-    
+    # The wrapper is built after model.eval(), so it starts out in training
+    # mode and the exporter warns about it.
+    wrapper.eval()
+
     # Run test forward pass
     with torch.no_grad():
         try:
@@ -80,6 +112,7 @@ def export_local_to_onnx(local_dir, resolution=518):
             input_names=['image'],
             output_names=['depth']
         )
+        inline_external_data(output_path)
         print(f"[SUCCESS] FP32 ONNX model saved to: {output_path}")
     except Exception as e:
         print(f"[ERROR] ONNX export failed: {e}")
@@ -94,6 +127,7 @@ def export_local_to_onnx(local_dir, resolution=518):
         model_fp16 = model.half()
         dummy_input_fp16 = dummy_input.half()
         wrapper_fp16 = OnnxWrapper(model_fp16)
+        wrapper_fp16.eval()
         
         torch.onnx.export(
             wrapper_fp16,
@@ -105,6 +139,7 @@ def export_local_to_onnx(local_dir, resolution=518):
             input_names=['image'],
             output_names=['depth']
         )
+        inline_external_data(output_path_fp16)
         print(f"[SUCCESS] FP16 ONNX model saved to: {output_path_fp16}")
     except Exception as e:
         print(f"[WARNING] Could not export FP16 version automatically (often requires GPU): {e}")
@@ -137,6 +172,14 @@ std::vector<fs::path> find_local_model_folders() {
 }
 
 int main() {
+    // torch's exporter narrates its progress with emoji. On a console that is
+    // not UTF-8 — which is any non-English Windows install — printing one
+    // raises 'charmap codec can't encode character', and since that happens on
+    // the way out of a finished export, the tool reports failure for work it
+    // already did. The child python inherits this environment.
+    SetConsoleOutputCP(CP_UTF8);
+    _putenv_s("PYTHONIOENCODING", "utf-8");
+
     std::cout << "====================================================\n";
     std::cout << "      FlatVR Local Depth Model Converter (C++)\n";
     std::cout << "====================================================\n\n";
