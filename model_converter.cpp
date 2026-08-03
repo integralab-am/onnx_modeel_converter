@@ -12,25 +12,34 @@ const std::string PY_SCRIPT_CONTENT = R"(import argparse
 import sys
 import os
 
-def inline_external_data(path):
-    """Fold the weights back into the .onnx file.
+# onnxruntime refuses to load anything newer than this, and FlatVR ships 1.17:
+# "Unsupported model IR version: 10, max supported IR version: 9". Current onnx
+# releases stamp 10 by default, so every freshly exported model is rejected.
+MAX_IR_VERSION = 9
 
-    Newer torch exporters write the tensors to a sibling '<name>.onnx.data' and
-    leave only the graph behind, which makes the .onnx a ~2 MB stub. FlatVR is
-    handed a single path and the instructions say to copy one file, so a model
-    split in two silently fails to load wherever it lands.
+def finalize_onnx(path):
+    """Make an exported graph loadable by the runtime FlatVR ships.
+
+    Two things need fixing after export. Newer torch exporters write the
+    tensors to a sibling '<name>.onnx.data' and leave the .onnx a ~2 MB stub,
+    while the instructions say to copy one file — so what arrives is a graph
+    with no weights. And the IR version is stamped higher than the runtime
+    accepts, which fails the load outright.
     """
     try:
         import onnx
     except ImportError:
-        print("[WARNING] onnx not available, leaving external weights as-is.")
+        print("[WARNING] onnx not available; leaving the exported file as-is.")
         return
 
     try:
         model = onnx.load(path)  # pulls the sidecar in
+        if model.ir_version > MAX_IR_VERSION:
+            print(f"[INFO] Lowering IR version {model.ir_version} -> {MAX_IR_VERSION}.")
+            model.ir_version = MAX_IR_VERSION
         onnx.save(model, path, save_as_external_data=False)
     except Exception as e:
-        print(f"[WARNING] Could not inline external weights: {e}")
+        print(f"[WARNING] Could not finalize {os.path.basename(path)}: {e}")
         return
 
     sidecar = path + ".data"
@@ -39,7 +48,7 @@ def inline_external_data(path):
             os.remove(sidecar)
         except OSError:
             pass
-    print(f"[INFO] Weights inlined; {os.path.basename(path)} is self-contained.")
+    print(f"[INFO] {os.path.basename(path)} is self-contained and IR {MAX_IR_VERSION}.")
 
 def export_local_to_onnx(local_dir, resolution=518):
     print("--------------------------------------------------")
@@ -112,7 +121,7 @@ def export_local_to_onnx(local_dir, resolution=518):
             input_names=['image'],
             output_names=['depth']
         )
-        inline_external_data(output_path)
+        finalize_onnx(output_path)
         print(f"[SUCCESS] FP32 ONNX model saved to: {output_path}")
     except Exception as e:
         print(f"[ERROR] ONNX export failed: {e}")
@@ -144,6 +153,7 @@ def export_local_to_onnx(local_dir, resolution=518):
         fp16_model = float16.convert_float_to_float16(
             fp32_model, keep_io_types=True, disable_shape_infer=True)
         onnx.save(fp16_model, output_path_fp16, save_as_external_data=False)
+        finalize_onnx(output_path_fp16)
 
         print(f"[SUCCESS] FP16 ONNX model saved to: {output_path_fp16}")
     except Exception as e:
