@@ -17,14 +17,16 @@ import os
 # releases stamp 10 by default, so every freshly exported model is rejected.
 MAX_IR_VERSION = 9
 
-def finalize_onnx(path):
+def finalize_onnx(path, resolution=None):
     """Make an exported graph loadable by the runtime FlatVR ships.
 
-    Two things need fixing after export. Newer torch exporters write the
+    Three things need fixing after export. Newer torch exporters write the
     tensors to a sibling '<name>.onnx.data' and leave the .onnx a ~2 MB stub,
     while the instructions say to copy one file — so what arrives is a graph
-    with no weights. And the IR version is stamped higher than the runtime
-    accepts, which fails the load outright.
+    with no weights. The IR version can be stamped higher than the runtime
+    accepts, which fails the load outright. And the TorchScript exporter
+    leaves the output dimensions unset, which is worth filling in since the
+    shape is fixed and known.
     """
     try:
         import onnx
@@ -37,6 +39,12 @@ def finalize_onnx(path):
         if model.ir_version > MAX_IR_VERSION:
             print(f"[INFO] Lowering IR version {model.ir_version} -> {MAX_IR_VERSION}.")
             model.ir_version = MAX_IR_VERSION
+        if resolution is not None:
+            dims = model.graph.output[0].type.tensor_type.shape.dim
+            if len(dims) == 3 and all(d.dim_value == 0 for d in dims):
+                for d, v in zip(dims, (1, resolution, resolution)):
+                    d.ClearField('dim_param')
+                    d.dim_value = v
         onnx.save(model, path, save_as_external_data=False)
     except Exception as e:
         print(f"[WARNING] Could not finalize {os.path.basename(path)}: {e}")
@@ -109,7 +117,13 @@ def export_local_to_onnx(local_dir, resolution=518):
             print(f"[ERROR] Test forward pass failed: {e}")
             return False
         
-    # Export FP32 ONNX
+    # Export FP32 ONNX.
+    #
+    # dynamo=False keeps the old TorchScript exporter. The new one ignores
+    # opset_version here (it cannot lower Resize below 18), stamps a newer IR
+    # version than onnxruntime 1.17 accepts, and writes the weights to a
+    # separate .onnx.data. The old one lands on opset 14 / IR 7 in a single
+    # file, matching what the stock models ship as.
     try:
         torch.onnx.export(
             wrapper,
@@ -119,9 +133,10 @@ def export_local_to_onnx(local_dir, resolution=518):
             opset_version=14,
             do_constant_folding=True,
             input_names=['image'],
-            output_names=['depth']
+            output_names=['depth'],
+            dynamo=False
         )
-        finalize_onnx(output_path)
+        finalize_onnx(output_path, resolution)
         print(f"[SUCCESS] FP32 ONNX model saved to: {output_path}")
     except Exception as e:
         print(f"[ERROR] ONNX export failed: {e}")
@@ -129,35 +144,59 @@ def export_local_to_onnx(local_dir, resolution=518):
         
     # Export FP16 ONNX.
     #
-    # Casting the torch model with .half() before exporting makes the graph
-    # boundary float16 too, and FlatVR feeds its models float32: the tensors it
-    # binds are ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT and the compute shader that
-    # fills them writes a RWBuffer<float>. A model with float16 inputs does not
-    # error there, it hangs. Convert the exported FP32 graph instead and keep
-    # the boundary at float32, which is what the stock models ship as. It also
-    # removes the old GPU requirement, since nothing runs the model to do it.
-    try:
-        from onnxconverter_common import float16
-    except ImportError:
-        print("[WARNING] onnxconverter-common is not installed; skipping FP16.")
-        print("Install it with: pip install onnxconverter-common")
-        return True
-
+    # The boundary has to stay float32: FlatVR binds
+    # ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT and fills it from a RWBuffer<float>
+    # compute shader, and a float16 input does not raise there, it hangs. So
+    # the body is halved and the wrapper casts on the way in and out, letting
+    # the exporter place consistent casts itself.
+    #
+    # Converting the finished FP32 graph with onnxconverter-common was tried
+    # and does not work here: keep_io_types left float32 wired straight into an
+    # fp16 Conv, and patching that around revealed it had also desynchronised
+    # the model's own Cast nodes.
+    #
+    # Measure before preferring this over the FP32 file. On DirectML the extra
+    # casts can push part of the graph onto the CPU, and a Depth Anything V2
+    # Small at 392 measured 37 ms as FP16 against 7.5 ms as FP32 on the same
+    # GPU. FP16 saves memory; it only saves time when the whole graph still
+    # lands on the accelerator.
     try:
         output_filename_fp16 = f"{folder_name}_{resolution}_fp16.onnx"
         output_path_fp16 = output_filename_fp16
-        print(f"\nConverting to FP16 ONNX: {output_path_fp16}...")
+        print(f"\nExporting model to FP16 ONNX: {output_path_fp16}...")
 
-        import onnx
-        fp32_model = onnx.load(output_path)
-        fp16_model = float16.convert_float_to_float16(
-            fp32_model, keep_io_types=True, disable_shape_infer=True)
-        onnx.save(fp16_model, output_path_fp16, save_as_external_data=False)
-        finalize_onnx(output_path_fp16)
+        class HalfBody(torch.nn.Module):
+            def __init__(self, model):
+                super().__init__()
+                self.model = model
 
+            def forward(self, x):
+                out = self.model(x.half())
+                if hasattr(out, 'predicted_depth'):
+                    out = out.predicted_depth
+                elif isinstance(out, dict) and 'predicted_depth' in out:
+                    out = out['predicted_depth']
+                return out.float()
+
+        wrapper_fp16 = HalfBody(model.half())
+        wrapper_fp16.eval()
+
+        with torch.no_grad():
+            torch.onnx.export(
+                wrapper_fp16,
+                dummy_input,
+                output_path_fp16,
+                export_params=True,
+                opset_version=14,
+                do_constant_folding=True,
+                input_names=['image'],
+                output_names=['depth'],
+                dynamo=False
+            )
+        finalize_onnx(output_path_fp16, resolution)
         print(f"[SUCCESS] FP16 ONNX model saved to: {output_path_fp16}")
     except Exception as e:
-        print(f"[WARNING] Could not produce the FP16 version: {e}")
+        print(f"[WARNING] Could not export the FP16 version: {e}")
         print("You can still use the FP32 version which was successfully exported.")
         
     return True
@@ -220,8 +259,8 @@ int main() {
     }
 
     // 2. Install dependencies
-    std::cout << "[INFO] Verifying/installing packages (torch, transformers, onnx, onnxconverter-common)...\n";
-    std::string pip_cmd = python_cmd + " -m pip install torch torchvision transformers onnx onnxconverter-common --upgrade --no-cache-dir";
+    std::cout << "[INFO] Verifying/installing packages (torch, transformers, onnx)...\n";
+    std::string pip_cmd = python_cmd + " -m pip install torch torchvision transformers onnx --upgrade --no-cache-dir";
     int pip_res = std::system(pip_cmd.c_str());
     if (pip_res != 0) {
         std::cerr << "[ERROR] Failed to install/verify python packages.\n";

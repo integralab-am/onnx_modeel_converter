@@ -10,6 +10,8 @@ The tool automatically exports both the high-precision **FP32** version (`.onnx`
 
 In the FP16 build only the weights are half precision — the graph boundary stays float32. FlatVR binds float32 tensors and fills them from a `RWBuffer<float>` compute shader, so a model with float16 inputs will not raise an error, it will hang. Both files are self-contained; the weights are never left in a separate `.onnx.data` sidecar.
 
+> **Measure before assuming FP16 is faster.** The casts it needs can leave part of the graph off the accelerator. Depth Anything V2 Small at 392×392 measured **37 ms as FP16 against 7.5 ms as FP32** on the same GPU under DirectML, because the FP16 graph did not fully assign to the DirectML provider. FP16 reliably saves memory; it saves time only when the whole graph still lands on the accelerator. Try both.
+
 Pick a resolution that is a **multiple of 14**, the patch size of the DINOv2 backbone (e.g. `252`, `336`, `392`, `448`, `518`). Cost scales with the number of patches, so 392 sits roughly midway between the stock 252 and 518 presets in both speed and quality.
 
 ---
