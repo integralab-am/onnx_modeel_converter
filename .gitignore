@@ -13,3 +13,6 @@ build/
 
 # Written and removed by the converter at runtime
 temp_export_onnx.py
+
+# Depth Anything 3 network code, downloaded by the converter on first use
+da3_code/
